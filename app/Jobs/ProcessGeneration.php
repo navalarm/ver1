@@ -3,9 +3,9 @@
 namespace App\Jobs;
 
 use App\Models\Generation;
+use App\Services\RunwareService;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
-use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 
@@ -13,7 +13,7 @@ class ProcessGeneration implements ShouldQueue
 {
     use Queueable;
 
-    public $timeout = 600; // 10 minutes timeout
+    public $timeout = 600;
 
     /**
      * Create a new job instance.
@@ -25,35 +25,55 @@ class ProcessGeneration implements ShouldQueue
     /**
      * Execute the job.
      */
-    public function handle(): void
+    public function handle(RunwareService $runware): void
     {
         try {
             $this->generation->update(['status' => 'processing']);
 
-            // Submit generation request to Runware API
-            $response = Http::withHeaders([
-                'Authorization' => 'Bearer ' . config('services.runware.api_key'),
-                'Content-Type' => 'application/json',
-            ])->post(config('services.runware.api_url') . '/generate', [
-                'prompt' => $this->generation->prompt,
-                'image' => Storage::url($this->generation->input_image_path),
-                // Add other Runware API parameters as needed
+            // Step 1: Upload image to Runware
+            $localImagePath = Storage::path($this->generation->input_image_path);
+
+            Log::info('Uploading image to Runware', [
+                'generation_id' => $this->generation->id,
+                'image_path' => $localImagePath,
             ]);
 
-            if ($response->successful()) {
-                $data = $response->json();
+            $imageUUID = $runware->uploadImage($localImagePath);
 
-                // Store task ID for tracking
-                $this->generation->update([
-                    'runware_task_id' => $data['task_id'] ?? null,
-                ]);
-
-                // Poll for completion (this is a simplified example)
-                // In production, you might want to use webhooks or separate polling job
-                $this->pollForCompletion($data['task_id'] ?? null);
-            } else {
-                throw new \Exception('Runware API request failed: ' . $response->body());
+            if (!$imageUUID) {
+                throw new \Exception('Failed to upload image to Runware');
             }
+
+            Log::info('Image uploaded successfully', [
+                'generation_id' => $this->generation->id,
+                'imageUUID' => $imageUUID,
+            ]);
+
+            // Step 2: Create video generation task
+            $result = $runware->createVideoGeneration(
+                $imageUUID,
+                $this->generation->prompt,
+                5 // 5 seconds duration
+            );
+
+            if (!$result || $result['status'] === 'error') {
+                throw new \Exception($result['error'] ?? 'Failed to create video generation');
+            }
+
+            // Store task UUID
+            $this->generation->update([
+                'runware_task_id' => $result['taskUUID'],
+            ]);
+
+            Log::info('Video generation started', [
+                'generation_id' => $this->generation->id,
+                'taskUUID' => $result['taskUUID'],
+            ]);
+
+            // Step 3: Dispatch status checking job (delayed 10 seconds)
+            CheckGenerationStatus::dispatch($this->generation)
+                ->delay(now()->addSeconds(10));
+
         } catch (\Exception $e) {
             Log::error('Generation failed', [
                 'generation_id' => $this->generation->id,
@@ -64,52 +84,6 @@ class ProcessGeneration implements ShouldQueue
                 'status' => 'failed',
                 'error_message' => $e->getMessage(),
             ]);
-
-            throw $e;
         }
-    }
-
-    protected function pollForCompletion(?string $taskId): void
-    {
-        if (!$taskId) {
-            throw new \Exception('No task ID provided');
-        }
-
-        $maxAttempts = 30;
-        $attempt = 0;
-
-        while ($attempt < $maxAttempts) {
-            sleep(10); // Wait 10 seconds between polls
-
-            $response = Http::withHeaders([
-                'Authorization' => 'Bearer ' . config('services.runware.api_key'),
-            ])->get(config('services.runware.api_url') . '/status/' . $taskId);
-
-            if ($response->successful()) {
-                $data = $response->json();
-
-                if ($data['status'] === 'completed') {
-                    // Download and save the generated video
-                    $videoUrl = $data['output_url'];
-                    $videoContent = file_get_contents($videoUrl);
-                    $videoPath = 'generations/' . $this->generation->hash . '.mp4';
-
-                    Storage::put($videoPath, $videoContent);
-
-                    $this->generation->update([
-                        'status' => 'completed',
-                        'output_video_path' => $videoPath,
-                    ]);
-
-                    return;
-                } elseif ($data['status'] === 'failed') {
-                    throw new \Exception('Generation failed on Runware side');
-                }
-            }
-
-            $attempt++;
-        }
-
-        throw new \Exception('Generation timeout: exceeded maximum polling attempts');
     }
 }
